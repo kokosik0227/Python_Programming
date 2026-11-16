@@ -1,0 +1,541 @@
+from __future__ import annotations
+
+import html
+import logging
+import os
+import re
+import time
+import uuid
+from bisect import bisect_left
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Annotated, Literal
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from markupsafe import Markup
+from pydantic import BaseModel, ConfigDict, Field
+
+from findex.index import Index, open_index
+from findex.models import SearchResult
+from findex.ranking import BM25Scorer, Scorer, TfIdfScorer
+from findex.search import SearchEngine, parse_query
+from findex.semantic import SemanticIndex, reciprocal_rank_fusion
+from findex.tokenize import tokenize
+
+logger = logging.getLogger("findex.web")
+WEB_DIR = Path(__file__).parent
+TEMPLATES = Jinja2Templates(directory=str(WEB_DIR / "templates"))
+STATIC_DIR = WEB_DIR / "static"
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+
+SearchMode = Literal["bm25", "tfidf", "semantic", "hybrid"]
+
+
+def _highlight_html(text: str, words: Iterable[str]) -> Markup:
+    """Safely escape text and wrap matched query words in <mark> tags."""
+    escaped = html.escape(text)
+    clean_words = sorted({w.strip() for w in words if w.strip()}, key=len, reverse=True)
+    if not clean_words:
+        return Markup(escaped)
+    pattern = re.compile(
+        "(" + "|".join(re.escape(html.escape(w)) for w in clean_words) + ")",
+        re.IGNORECASE,
+    )
+    highlighted = pattern.sub(r"<mark>\1</mark>", escaped)
+    return Markup(highlighted)
+
+
+TEMPLATES.env.filters["highlight"] = _highlight_html  # type: ignore[assignment]
+
+
+def _default_index_path() -> Path:
+    return Path(os.getenv("INDEX_PATH", "index.pkl"))
+
+
+def _default_embeddings_path() -> Path:
+    return Path(os.getenv("EMBEDDINGS_PATH", "embeddings.npy"))
+
+
+def _default_page_size() -> int:
+    raw = os.getenv("PAGE_SIZE", "10")
+    try:
+        return int(raw)
+    except ValueError:
+        return 10
+
+
+class Settings(BaseModel):
+    """Runtime configuration loaded from environment variables."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    index_path: Path = Field(default_factory=_default_index_path)
+    embeddings_path: Path = Field(default_factory=_default_embeddings_path)
+    page_size: int = Field(default_factory=_default_page_size, ge=1, le=100)
+    log_level: str = Field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
+
+    @classmethod
+    def from_env(cls) -> Settings:
+        return cls.model_validate(
+            {
+                "index_path": os.getenv("INDEX_PATH", "index.pkl"),
+                "embeddings_path": os.getenv("EMBEDDINGS_PATH", "embeddings.npy"),
+                "page_size": os.getenv("PAGE_SIZE", "10"),
+                "log_level": os.getenv("LOG_LEVEL", "INFO"),
+            }
+        )
+
+
+class SearchItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    doc_id: int
+    title: str
+    score: float
+    path: str
+    snippet: str
+
+
+class SearchResponse(BaseModel):
+    query: str
+    scorer: SearchMode
+    mode: SearchMode
+    page: int
+    page_size: int
+    total: int
+    pages: int
+    took_ms: float
+    results: list[SearchItem]
+
+
+class DocumentResponse(BaseModel):
+    doc_id: int
+    title: str
+    path: str
+    content: str
+
+
+class StatsResponse(BaseModel):
+    documents: int
+    terms: int
+    vocabulary: int
+    average_document_length: float
+    index_size_bytes: int
+    uptime_seconds: float
+
+
+class HealthResponse(BaseModel):
+    status: Literal["ok", "starting"]
+
+
+@dataclass(slots=True)
+class AppState:
+    index: Index | None = None
+    semantic: SemanticIndex | None = None
+    started_at: float = field(default_factory=time.monotonic)
+
+
+def _resolve_document_path(raw_path: str) -> tuple[str, Path]:
+    normalized = raw_path.replace("\\", "/")
+    candidate = Path(normalized)
+    if candidate.is_file():
+        return normalized, candidate
+    fallback = DATA_DIR / candidate.name
+    if fallback.is_file():
+        return normalized, fallback
+    return normalized, candidate
+
+
+def _reconstruct_document_from_index(index: Index, doc_id: int, length: int) -> str:
+    """Reconstruct document text from positional postings when raw .txt is not deployed."""
+    tokens = [""] * max(length, 1)
+    for term in index:
+        postings = index[term]
+        idx = bisect_left(postings, doc_id, key=lambda p: p.doc_id)
+        if idx < len(postings) and postings[idx].doc_id == doc_id:
+            for pos in postings[idx].positions:
+                if 0 <= pos < len(tokens):
+                    tokens[pos] = term
+    return " ".join(t for t in tokens if t)
+
+
+def _read_document(index: Index, doc_id: int) -> tuple[str, str]:
+    try:
+        meta = index.get_meta(doc_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Document not found") from exc
+    display_path, resolved_path = _resolve_document_path(meta.path)
+    if resolved_path.is_file():
+        try:
+            content = resolved_path.read_text(encoding="utf-8")
+            return display_path, content
+        except OSError:
+            pass
+    content = _reconstruct_document_from_index(index, doc_id, meta.length)
+    return display_path, content
+
+
+def _snippet(engine: SearchEngine, index: Index, doc_id: int, query_words: set[str]) -> str:
+    meta = index.get_meta(doc_id)
+    _, resolved_path = _resolve_document_path(meta.path)
+    if resolved_path.is_file():
+        try:
+            content = resolved_path.read_text(encoding="utf-8")
+            raw_snippet = engine.generate_snippet(content, query_words)
+            return ANSI_ESCAPE_RE.sub("", raw_snippet)
+        except OSError:
+            pass
+    parts: list[str] = []
+    for word in sorted(query_words):
+        postings = index[word]
+        idx = bisect_left(postings, doc_id, key=lambda p: p.doc_id)
+        if idx < len(postings) and postings[idx].doc_id == doc_id:
+            p = postings[idx]
+            sample_pos = ", ".join(str(pos) for pos in p.positions[:5])
+            parts.append(f"{word} (×{p.frequency}, поз. {sample_pos})")
+    doc_name = Path(meta.path.replace("\\", "/")).name
+    if parts:
+        return f"... Знайдено у {doc_name}: " + "; ".join(parts) + " ..."
+    return f"... Документ {doc_name} ({meta.length} слів) ..."
+
+
+def _ensure_semantic_index(state: AppState, index: Index, settings: Settings) -> SemanticIndex:
+    if state.semantic is not None and state.semantic.num_docs == index.num_docs:
+        return state.semantic
+    if settings.embeddings_path.is_file():
+        try:
+            loaded = SemanticIndex.load(settings.embeddings_path)
+            if loaded.num_docs == index.num_docs:
+                state.semantic = loaded
+                return loaded
+        except Exception:
+            logger.exception("Could not load embeddings from %s", settings.embeddings_path)
+    state.semantic = SemanticIndex.from_inverted_index(index)
+    return state.semantic
+
+
+def _search(
+    index: Index,
+    query: str,
+    k: int,
+    mode_name: SearchMode,
+    page: int,
+    state: AppState | None = None,
+    settings: Settings | None = None,
+) -> tuple[SearchResponse, set[str]]:
+    t0 = time.perf_counter()
+    if not query.strip():
+        raise ValueError("Empty query")
+
+    scorer: Scorer = TfIdfScorer(index) if mode_name == "tfidf" else BM25Scorer(index)
+    engine = SearchEngine(index, scorer)
+    max_docs = max(index.num_docs, 1)
+
+    all_results: list[SearchResult]
+    query_words: set[str]
+
+    if mode_name in ("bm25", "tfidf"):
+        ast = parse_query(query)
+        query_words = engine.extract_raw_words(ast)
+        all_results = engine.search(query, top_k=max_docs)
+    else:
+        query_words = set(tokenize(query))
+        if not query_words:
+            raise ValueError("Empty semantic query")
+        app_state = state or AppState(index=index)
+        app_settings = settings or Settings.from_env()
+        sem_index = _ensure_semantic_index(app_state, index, app_settings)
+        sem_results = sem_index.search(query, top_k=max_docs)
+        if mode_name == "semantic":
+            all_results = sem_results
+        else:
+            try:
+                bm25_results = engine.search(query, top_k=max_docs)
+            except ValueError:
+                or_query = " OR ".join(sorted(query_words))
+                bm25_results = engine.search(or_query, top_k=max_docs)
+            all_results = reciprocal_rank_fusion(
+                bm25_results,
+                sem_results,
+                top_k=max_docs,
+            )
+
+    start = (page - 1) * k
+    paged = all_results[start : start + k]
+    total = len(all_results)
+    pages = (total + k - 1) // k
+    items: list[SearchItem] = []
+    for result in paged:
+        norm_path = index.get_meta(result.doc_id).path.replace("\\", "/")
+        items.append(
+            SearchItem(
+                doc_id=result.doc_id,
+                title=Path(norm_path).name,
+                score=round(result.score, 6),
+                path=norm_path,
+                snippet=_snippet(engine, index, result.doc_id, query_words),
+            )
+        )
+    took_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+    response = SearchResponse(
+        query=query,
+        scorer=mode_name,
+        mode=mode_name,
+        page=page,
+        page_size=k,
+        total=total,
+        pages=pages,
+        took_ms=took_ms,
+        results=items,
+    )
+    return response, query_words
+
+
+def get_index(request: Request) -> Index:
+    index = getattr(request.app.state, "findex", AppState()).index
+    if index is None:
+        raise HTTPException(status_code=503, detail="Index is not loaded")
+    return index
+
+
+def get_settings(request: Request) -> Settings:
+    settings = getattr(request.app.state, "settings", None)
+    if isinstance(settings, Settings):
+        return settings
+    return Settings.from_env()
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
+    settings: Settings = getattr(application.state, "settings", Settings.from_env())
+    application.state.findex = AppState(started_at=time.monotonic())
+    try:
+        with open_index(settings.index_path) as index:
+            application.state.findex.index = index
+            if settings.embeddings_path.is_file():
+                try:
+                    application.state.findex.semantic = SemanticIndex.load(settings.embeddings_path)
+                except Exception:
+                    logger.exception("Could not load embeddings from %s", settings.embeddings_path)
+            logger.info(
+                "Loaded index from %s (%d docs, %d terms)",
+                settings.index_path,
+                index.num_docs,
+                len(index),
+            )
+            yield
+    except Exception:
+        logger.exception("Could not load index from %s", settings.index_path)
+        yield
+    finally:
+        application.state.findex.index = None
+        application.state.findex.semantic = None
+
+
+def create_app(
+    settings: Settings | None = None,
+    *,
+    async_search: bool = False,
+) -> FastAPI:
+    runtime_settings = settings or Settings.from_env()
+    application = FastAPI(title="Findex", version="1.0.0", lifespan=lifespan)
+    application.state.settings = runtime_settings
+    if STATIC_DIR.is_dir():
+        application.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    @application.middleware("http")
+    async def request_context(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        request_id = str(uuid.uuid4())
+        request.state.request_id = request_id
+        try:
+            response = await call_next(request)
+        except Exception:
+            logger.exception("Unhandled exception request_id=%s", request_id)
+            response = JSONResponse(
+                status_code=500,
+                content={"detail": "Internal server error", "request_id": request_id},
+            )
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+    @application.get("/", response_class=HTMLResponse, include_in_schema=False)
+    def home(
+        request: Request,
+        q: Annotated[str, Query(max_length=500)] = "",
+        scorer: Annotated[SearchMode, Query()] = "bm25",
+        mode: Annotated[SearchMode | None, Query()] = None,
+        k: Annotated[int | None, Query(ge=1, le=100)] = None,
+        page: Annotated[int, Query(ge=1)] = 1,
+        doc_id: Annotated[int | None, Query(ge=0)] = None,
+        index: Index = Depends(get_index),  # noqa: B008
+        app_settings: Settings = Depends(get_settings),  # noqa: B008
+    ) -> Response:
+        effective_mode: SearchMode = mode if mode is not None else scorer
+        page_size = k if k is not None else app_settings.page_size
+        results: SearchResponse | None = None
+        query_words: set[str] = set()
+        error: str | None = None
+        selected_doc: DocumentResponse | None = None
+        state: AppState = getattr(request.app.state, "findex", AppState(index=index))
+
+        if q.strip():
+            try:
+                results, query_words = _search(
+                    index, q, page_size, effective_mode, page, state=state, settings=app_settings
+                )
+            except ValueError:
+                error = "Некоректний синтаксис запиту. Перевірте оператори AND, OR, NOT та дужки."
+
+        if doc_id is not None:
+            try:
+                doc_path, doc_content = _read_document(index, doc_id)
+                selected_doc = DocumentResponse(
+                    doc_id=doc_id,
+                    title=Path(doc_path).name,
+                    path=doc_path,
+                    content=doc_content,
+                )
+            except HTTPException:
+                error = f"Документ #{doc_id} не знайдено."
+
+        return TEMPLATES.TemplateResponse(
+            request=request,
+            name="index.html",
+            context={
+                "q": q,
+                "scorer": effective_mode,
+                "mode": effective_mode,
+                "k": page_size,
+                "results": results,
+                "query_words": sorted(query_words),
+                "selected_doc": selected_doc,
+                "error": error,
+                "stats": {
+                    "documents": index.num_docs,
+                    "terms": len(index),
+                    "avg_len": round(index.avg_doc_length, 1),
+                },
+            },
+        )
+
+    @application.get("/doc/{doc_id}", response_class=HTMLResponse, include_in_schema=False)
+    def document_page(
+        request: Request,
+        doc_id: int,
+        q: str = Query(default="", max_length=500),
+        index: Index = Depends(get_index),  # noqa: B008
+    ) -> Response:
+        path, content = _read_document(index, doc_id)
+        query_words: set[str] = set()
+        if q.strip():
+            try:
+                engine = SearchEngine(index, BM25Scorer(index))
+                query_words = engine.extract_raw_words(parse_query(q))
+            except ValueError:
+                query_words = set(tokenize(q))
+        doc = DocumentResponse(
+            doc_id=doc_id,
+            title=Path(path).name,
+            path=path,
+            content=content,
+        )
+        return TEMPLATES.TemplateResponse(
+            request=request,
+            name="doc.html",
+            context={"doc": doc, "q": q, "query_words": sorted(query_words)},
+        )
+
+    if async_search:
+
+        @application.get("/search", response_model=SearchResponse)
+        async def search_async(
+            request: Request,
+            q: Annotated[str, Query(min_length=1, max_length=500)],
+            k: Annotated[int | None, Query(ge=1, le=100)] = None,
+            scorer: SearchMode = "bm25",
+            mode: SearchMode | None = None,
+            page: Annotated[int, Query(ge=1)] = 1,
+            index: Index = Depends(get_index),  # noqa: B008
+            app_settings: Settings = Depends(get_settings),  # noqa: B008
+        ) -> SearchResponse:
+            effective_mode: SearchMode = mode if mode is not None else scorer
+            page_size = k if k is not None else app_settings.page_size
+            state: AppState = getattr(request.app.state, "findex", AppState(index=index))
+            try:
+                response, _ = _search(
+                    index, q, page_size, effective_mode, page, state=state, settings=app_settings
+                )
+                return response
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail="Invalid query syntax") from exc
+
+    else:
+
+        @application.get("/search", response_model=SearchResponse)
+        def search(
+            request: Request,
+            q: Annotated[str, Query(min_length=1, max_length=500)],
+            k: Annotated[int | None, Query(ge=1, le=100)] = None,
+            scorer: SearchMode = "bm25",
+            mode: SearchMode | None = None,
+            page: Annotated[int, Query(ge=1)] = 1,
+            index: Index = Depends(get_index),  # noqa: B008
+            app_settings: Settings = Depends(get_settings),  # noqa: B008
+        ) -> SearchResponse:
+            effective_mode: SearchMode = mode if mode is not None else scorer
+            page_size = k if k is not None else app_settings.page_size
+            state: AppState = getattr(request.app.state, "findex", AppState(index=index))
+            try:
+                response, _ = _search(
+                    index, q, page_size, effective_mode, page, state=state, settings=app_settings
+                )
+                return response
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail="Invalid query syntax") from exc
+
+    @application.get("/docs/{doc_id}", response_model=DocumentResponse)
+    def document(doc_id: int, index: Index = Depends(get_index)) -> DocumentResponse:  # noqa: B008
+        path, content = _read_document(index, doc_id)
+        return DocumentResponse(doc_id=doc_id, title=Path(path).name, path=path, content=content)
+
+    @application.get("/stats", response_model=StatsResponse)
+    def stats(
+        request: Request,
+        index: Index = Depends(get_index),  # noqa: B008
+        app_settings: Settings = Depends(get_settings),  # noqa: B008
+    ) -> StatsResponse:
+        state: AppState = getattr(request.app.state, "findex", AppState())
+        uptime = max(0.0, time.monotonic() - state.started_at)
+        try:
+            size_bytes = app_settings.index_path.stat().st_size
+        except OSError:
+            size_bytes = 0
+        return StatsResponse(
+            documents=index.num_docs,
+            terms=len(index),
+            vocabulary=len(index),
+            average_document_length=index.avg_doc_length,
+            index_size_bytes=size_bytes,
+            uptime_seconds=round(uptime, 2),
+        )
+
+    @application.get("/health", response_model=HealthResponse)
+    def health(request: Request) -> HealthResponse:
+        index = getattr(request.app.state, "findex", AppState()).index
+        if index is None:
+            raise HTTPException(status_code=503, detail="Index is not loaded")
+        return HealthResponse(status="ok")
+
+    return application
+
+
+app = create_app()
